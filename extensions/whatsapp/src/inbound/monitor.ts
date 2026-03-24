@@ -78,6 +78,9 @@ export async function monitorWebInbox(options: {
 
   const selfJid = sock.user?.id;
   const selfE164 = selfJid ? jidToE164(selfJid) : null;
+  // Bot's own LID — not needed anymore; we resolve replySenderJid to E164
+  // via resolveInboundJid and compare with selfE164 in group gating.
+  const selfLid: string | undefined = undefined;
   const debouncer = createInboundDebouncer<WebInboundMessage>({
     debounceMs: options.debounceMs ?? 0,
     buildKey: (msg) => {
@@ -480,17 +483,16 @@ export async function monitorWebInbox(options: {
       replyToId: enriched.replyContext?.id,
       replyToBody: enriched.replyContext?.body,
       replyToSender: enriched.replyContext?.sender,
-      // Resolve LID→phone JID so reply-to-bot detection works when WhatsApp
+      // Resolve LID→phone so reply-to-bot detection works when WhatsApp
       // reports the quoted sender as a LID instead of a phone-number JID.
-      replyToSenderJid: enriched.replyContext?.senderJid
+      // Always resolve via resolveInboundJid to handle LID→phone mapping;
+      // the raw senderE164 from jidToE164 misinterprets LID numbers as phones.
+      replyToSenderJid: enriched.replyContext?.senderJid ?? undefined,
+      replyToSenderE164: enriched.replyContext?.senderJid
         ? ((await resolveInboundJid(enriched.replyContext.senderJid)) ??
-          enriched.replyContext.senderJid)
+          enriched.replyContext.senderE164 ??
+          undefined)
         : undefined,
-      replyToSenderE164: enriched.replyContext?.senderE164
-        ? enriched.replyContext.senderE164
-        : enriched.replyContext?.senderJid
-          ? ((await resolveInboundJid(enriched.replyContext.senderJid)) ?? undefined)
-          : undefined,
       replyToMediaPath: enriched.replyToMediaPath,
       replyToMediaType: enriched.replyToMediaType,
       groupSubject: inbound.groupSubject,

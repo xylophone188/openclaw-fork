@@ -140,6 +140,12 @@ export function applyGroupGating(params: ApplyGroupGatingParams) {
     (selfJid && replySenderJid && selfJid === replySenderJid) ||
     (selfE164 && replySenderE164 && selfE164 === replySenderE164),
   );
+  // Temporary debug — remove after fix confirmed
+  if (params.msg.replyToBody || params.msg.replyToSenderJid || params.msg.replyToSenderE164) {
+    console.error(
+      `[DEBUG gating] selfJid=${selfJid} selfLid=${selfLid} selfE164=${selfE164} replySenderJid=${replySenderJid} replySenderE164=${replySenderE164} replyToBody=${params.msg.replyToBody?.slice(0, 20)} implicit=${implicitMention}`,
+    );
+  }
   const mentionGate = resolveMentionGating({
     requireMention,
     canDetectMention: true,
