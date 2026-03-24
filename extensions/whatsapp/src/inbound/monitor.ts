@@ -480,8 +480,17 @@ export async function monitorWebInbox(options: {
       replyToId: enriched.replyContext?.id,
       replyToBody: enriched.replyContext?.body,
       replyToSender: enriched.replyContext?.sender,
-      replyToSenderJid: enriched.replyContext?.senderJid,
-      replyToSenderE164: enriched.replyContext?.senderE164,
+      // Resolve LID→phone JID so reply-to-bot detection works when WhatsApp
+      // reports the quoted sender as a LID instead of a phone-number JID.
+      replyToSenderJid: enriched.replyContext?.senderJid
+        ? ((await resolveInboundJid(enriched.replyContext.senderJid)) ??
+          enriched.replyContext.senderJid)
+        : undefined,
+      replyToSenderE164: enriched.replyContext?.senderE164
+        ? enriched.replyContext.senderE164
+        : enriched.replyContext?.senderJid
+          ? ((await resolveInboundJid(enriched.replyContext.senderJid)) ?? undefined)
+          : undefined,
       replyToMediaPath: enriched.replyToMediaPath,
       replyToMediaType: enriched.replyToMediaType,
       groupSubject: inbound.groupSubject,
