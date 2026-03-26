@@ -84,9 +84,14 @@ export async function monitorWebInbox(options: {
   const debouncer = createInboundDebouncer<WebInboundMessage>({
     debounceMs: options.debounceMs ?? 0,
     buildKey: (msg) => {
+      const sender = msg.sender;
       const senderKey =
         msg.chatType === "group"
-          ? (msg.senderJid ?? msg.senderE164 ?? msg.senderName ?? msg.from)
+          ? (getPrimaryIdentityId(sender ?? null) ??
+            msg.senderJid ??
+            msg.senderE164 ??
+            msg.senderName ??
+            msg.from)
           : msg.from;
       if (!senderKey) {
         return null;
@@ -106,7 +111,7 @@ export async function monitorWebInbox(options: {
       }
       const mentioned = new Set<string>();
       for (const entry of entries) {
-        for (const jid of entry.mentionedJids ?? []) {
+        for (const jid of entry.mentions ?? entry.mentionedJids ?? []) {
           mentioned.add(jid);
         }
       }
@@ -117,6 +122,7 @@ export async function monitorWebInbox(options: {
       const combinedMessage: WebInboundMessage = {
         ...last,
         body: combinedBody,
+        mentions: mentioned.size > 0 ? Array.from(mentioned) : undefined,
         mentionedJids: mentioned.size > 0 ? Array.from(mentioned) : undefined,
       };
       await options.onMessage(combinedMessage);
@@ -235,8 +241,10 @@ export async function monitorWebInbox(options: {
     }
 
     const group = isGroupJid(remoteJid);
+    // Drop echoes of messages the gateway itself sent (tracked by sendTrackedMessage).
+    // Applies to both groups and DMs/self-chat — without this, self-chat mode
+    // re-processes the bot's own replies as new inbound user messages.
     if (
-      group &&
       Boolean(msg.key?.fromMe) &&
       id &&
       isRecentOutboundMessage({
@@ -245,7 +253,7 @@ export async function monitorWebInbox(options: {
         messageId: id,
       })
     ) {
-      logVerbose(`Skipping recent outbound WhatsApp group echo ${id} for ${remoteJid}`);
+      logVerbose(`Skipping recent outbound WhatsApp echo ${id} for ${remoteJid}`);
       return null;
     }
     if (id) {
@@ -279,7 +287,7 @@ export async function monitorWebInbox(options: {
     const access = await checkInboundAccessControl({
       accountId: options.accountId,
       from,
-      selfE164,
+      selfE164: self.e164 ?? null,
       senderE164,
       group,
       pushName: msg.pushName ?? undefined,
@@ -457,7 +465,7 @@ export async function monitorWebInbox(options: {
     inboundLogger.info(
       {
         from: inbound.from,
-        to: selfE164 ?? "me",
+        to: self.e164 ?? "me",
         body: enriched.body,
         mediaPath: enriched.mediaPath,
         mediaType: enriched.mediaType,
@@ -470,16 +478,22 @@ export async function monitorWebInbox(options: {
       id: inbound.id,
       from: inbound.from,
       conversationId: inbound.from,
-      to: selfE164 ?? "me",
+      to: self.e164 ?? "me",
       accountId: inbound.access.resolvedAccountId,
       body: enriched.body,
       pushName: senderName,
       timestamp,
       chatType: inbound.group ? "group" : "direct",
       chatId: inbound.remoteJid,
+      sender: resolveComparableIdentity({
+        jid: inbound.participantJid,
+        e164: inbound.senderE164 ?? undefined,
+        name: senderName,
+      }),
       senderJid: inbound.participantJid,
       senderE164: inbound.senderE164 ?? undefined,
       senderName,
+      replyTo: enriched.replyContext ?? undefined,
       replyToId: enriched.replyContext?.id,
       replyToBody: enriched.replyContext?.body,
       replyToSender: enriched.replyContext?.sender,
@@ -497,9 +511,12 @@ export async function monitorWebInbox(options: {
       replyToMediaType: enriched.replyToMediaType,
       groupSubject: inbound.groupSubject,
       groupParticipants: inbound.groupParticipants,
+      mentions: mentionedJids ?? undefined,
       mentionedJids: mentionedJids ?? undefined,
-      selfJid,
-      selfE164,
+      self,
+      selfJid: self.jid ?? undefined,
+      selfLid: self.lid ?? undefined,
+      selfE164: self.e164 ?? undefined,
       fromMe: Boolean(msg.key?.fromMe),
       location: enriched.location ?? undefined,
       sendComposing,
