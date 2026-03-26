@@ -143,7 +143,7 @@ export function applyGroupGating(params: ApplyGroupGatingParams) {
   // Temporary debug — remove after fix confirmed
   if (params.msg.replyToBody || params.msg.replyToSenderJid || params.msg.replyToSenderE164) {
     console.error(
-      `[DEBUG gating] selfJid=${selfJid} selfLid=${selfLid} selfE164=${selfE164} replySenderJid=${replySenderJid} replySenderE164=${replySenderE164} replyToBody=${params.msg.replyToBody?.slice(0, 20)} implicit=${implicitMention}`,
+      `[DEBUG gating] selfJid=${selfJid} selfE164=${selfE164} replySenderJid=${replySenderJid} replySenderE164=${replySenderE164} replyToBody=${params.msg.replyToBody?.slice(0, 20)} implicit=${implicitMention}`,
     );
   }
   const mentionGate = resolveMentionGating({

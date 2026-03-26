@@ -105,9 +105,13 @@ export function normalizeToolParameters(
   // If schema already has type + properties (no top-level anyOf to merge),
   // clean it for Gemini/xAI compatibility as appropriate.
   if ("type" in schema && "properties" in schema && !Array.isArray(schema.anyOf)) {
+    const cleanedSchema = {
+      ...schema,
+      required: Array.isArray(schema.required) ? schema.required : [],
+    };
     return {
       ...tool,
-      parameters: applyProviderCleaning(schema),
+      parameters: applyProviderCleaning(cleanedSchema),
     };
   }
 
@@ -185,7 +189,7 @@ export function normalizeToolParameters(
     ...(typeof nextSchema.description === "string" ? { description: nextSchema.description } : {}),
     properties:
       Object.keys(mergedProperties).length > 0 ? mergedProperties : (schema.properties ?? {}),
-    ...(mergedRequired && mergedRequired.length > 0 ? { required: mergedRequired } : {}),
+    required: mergedRequired ?? [],
     additionalProperties: "additionalProperties" in schema ? schema.additionalProperties : true,
   };
 

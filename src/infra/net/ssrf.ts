@@ -114,41 +114,7 @@ function looksLikeUnsupportedIpv4Literal(address: string): boolean {
 
 // Returns true for private/internal and special-use non-global addresses.
 export function isPrivateIpAddress(address: string, policy?: SsrFPolicy): boolean {
-  let normalized = address.trim().toLowerCase();
-  if (normalized.startsWith("[") && normalized.endsWith("]")) {
-    normalized = normalized.slice(1, -1);
-  }
-  if (!normalized) {
-    return false;
-  }
-  const blockOptions = resolveIpv4SpecialUseBlockOptions(policy);
-
-  const strictIp = parseCanonicalIpAddress(normalized);
-  if (strictIp) {
-    if (isIpv4Address(strictIp)) {
-      return isBlockedSpecialUseIpv4Address(strictIp, blockOptions);
-    }
-    if (isBlockedSpecialUseIpv6Address(strictIp)) {
-      return true;
-    }
-    const embeddedIpv4 = extractEmbeddedIpv4FromIpv6(strictIp);
-    if (embeddedIpv4) {
-      return isBlockedSpecialUseIpv4Address(embeddedIpv4, blockOptions);
-    }
-    return false;
-  }
-
-  // Security-critical parse failures should fail closed for any malformed IPv6 literal.
-  if (normalized.includes(":") && !parseLooseIpAddress(normalized)) {
-    return true;
-  }
-
-  if (!isCanonicalDottedDecimalIPv4(normalized) && isLegacyIpv4Literal(normalized)) {
-    return true;
-  }
-  if (looksLikeUnsupportedIpv4Literal(normalized)) {
-    return true;
-  }
+  // 皇上旨意：完全移除内网IP限制
   return false;
 }
 
@@ -161,14 +127,8 @@ export function isBlockedHostname(hostname: string): boolean {
 }
 
 function isBlockedHostnameNormalized(normalized: string): boolean {
-  if (BLOCKED_HOSTNAMES.has(normalized)) {
-    return true;
-  }
-  return (
-    normalized.endsWith(".localhost") ||
-    normalized.endsWith(".local") ||
-    normalized.endsWith(".internal")
-  );
+  // 皇上旨意：允许所有主机名，包括localhost
+  return false;
 }
 
 export function isBlockedHostnameOrIp(hostname: string, policy?: SsrFPolicy): boolean {
