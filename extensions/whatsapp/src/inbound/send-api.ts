@@ -1,8 +1,7 @@
 import type { AnyMessageContent, WAPresence } from "@whiskeysockets/baileys";
 import { recordChannelActivity } from "openclaw/plugin-sdk/infra-runtime";
-import { toWhatsappJid } from "openclaw/plugin-sdk/text-runtime";
 import type { ActiveWebSendOptions } from "../active-listener.js";
-import { extractOutboundMentions } from "./outbound-mentions.js";
+import { toWhatsappJid } from "../text-runtime.js";
 
 function recordWhatsAppOutbound(accountId: string) {
   recordChannelActivity({
@@ -16,16 +15,6 @@ function resolveOutboundMessageId(result: unknown): string {
   return typeof result === "object" && result && "key" in result
     ? String((result as { key?: { id?: string } }).key?.id ?? "unknown")
     : "unknown";
-}
-
-// Known limitation: this helper has no access to the per-group participantJidMap
-// that monitor.ts builds for auto-reply closures. Mentions through this path
-// (CLI `message send`, message tool, sendApi IPC) default to @s.whatsapp.net,
-// which is incorrect for LID-based participants. The auto-reply path is unaffected.
-function mentionsSpread(text: string | undefined): { mentions: string[] } | Record<string, never> {
-  if (!text) return {};
-  const mentions = extractOutboundMentions(text);
-  return mentions.length > 0 ? { mentions } : {};
 }
 
 export function createWebSendApi(params: {
@@ -45,13 +34,15 @@ export function createWebSendApi(params: {
     ): Promise<{ messageId: string }> => {
       const jid = toWhatsappJid(to);
       let payload: AnyMessageContent;
+      if (mediaBuffer) {
+        mediaType ??= "application/octet-stream";
+      }
       if (mediaBuffer && mediaType) {
         if (mediaType.startsWith("image/")) {
           payload = {
             image: mediaBuffer,
             caption: text || undefined,
             mimetype: mediaType,
-            ...mentionsSpread(text),
           };
         } else if (mediaType.startsWith("audio/")) {
           payload = { audio: mediaBuffer, ptt: true, mimetype: mediaType };
@@ -62,7 +53,6 @@ export function createWebSendApi(params: {
             caption: text || undefined,
             mimetype: mediaType,
             ...(gifPlayback ? { gifPlayback: true } : {}),
-            ...mentionsSpread(text),
           };
         } else {
           const fileName = sendOptions?.fileName?.trim() || "file";
@@ -71,11 +61,10 @@ export function createWebSendApi(params: {
             fileName,
             caption: text || undefined,
             mimetype: mediaType,
-            ...mentionsSpread(text),
           };
         }
       } else {
-        payload = { text, ...mentionsSpread(text) };
+        payload = { text };
       }
       const result = await params.sock.sendMessage(jid, payload);
       const accountId = sendOptions?.accountId ?? params.defaultAccountId;

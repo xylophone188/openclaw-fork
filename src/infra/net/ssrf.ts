@@ -246,6 +246,7 @@ export type PinnedDispatcherPolicy =
   | {
       mode: "explicit-proxy";
       proxyUrl: string;
+      allowPrivateProxy?: boolean;
       proxyTls?: Record<string, unknown>;
       pinnedHostname?: PinnedHostnameOverride;
     };

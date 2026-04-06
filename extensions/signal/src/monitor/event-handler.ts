@@ -16,9 +16,18 @@ import {
 import { createChannelReplyPipeline } from "openclaw/plugin-sdk/channel-reply-pipeline";
 import { resolveControlCommandGate } from "openclaw/plugin-sdk/command-auth";
 import { hasControlCommand } from "openclaw/plugin-sdk/command-auth";
-import { resolveChannelGroupRequireMention } from "openclaw/plugin-sdk/config-runtime";
+import {
+  resolveChannelGroupPolicy,
+  resolveChannelGroupRequireMention,
+} from "openclaw/plugin-sdk/config-runtime";
 import { readSessionUpdatedAt, resolveStorePath } from "openclaw/plugin-sdk/config-runtime";
 import { recordInboundSession } from "openclaw/plugin-sdk/conversation-runtime";
+import {
+  createInternalHookEvent,
+  fireAndForgetHook,
+  toInternalMessageReceivedContext,
+  triggerInternalHook,
+} from "openclaw/plugin-sdk/hook-runtime";
 import { enqueueSystemEvent } from "openclaw/plugin-sdk/infra-runtime";
 import { kindFromMime } from "openclaw/plugin-sdk/media-runtime";
 import {
@@ -47,7 +56,7 @@ import {
   resolveSignalSender,
   type SignalSender,
 } from "../identity.js";
-import { normalizeSignalMessagingTarget } from "../runtime-api.js";
+import { normalizeSignalMessagingTarget } from "../normalize.js";
 import { sendMessageSignal, sendReadReceiptSignal, sendTypingSignal } from "../send.js";
 import { handleSignalDirectMessageAccess, resolveSignalAccessState } from "./access-policy.js";
 import type {
@@ -56,6 +65,7 @@ import type {
   SignalReactionMessage,
   SignalReceivePayload,
 } from "./event-handler.types.js";
+import { resolveSignalQuoteContext } from "./inbound-context.js";
 import { renderSignalMentions } from "./mentions.js";
 
 function formatAttachmentKindCount(kind: string, count: number): string {
@@ -112,11 +122,11 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
     mediaType?: string;
     mediaPaths?: string[];
     mediaTypes?: string[];
-    replyToBody?: string;
-    replyToMediaPath?: string;
-    replyToMediaType?: string;
     commandAuthorized: boolean;
     wasMentioned?: boolean;
+    replyToBody?: string;
+    replyToSender?: string;
+    replyToIsQuote?: boolean;
   };
 
   async function handleSignalInboundMessage(entry: SignalInboundEntry) {
@@ -208,6 +218,9 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
       Provider: "signal" as const,
       Surface: "signal" as const,
       MessageSid: entry.messageId,
+      ReplyToBody: entry.replyToBody,
+      ReplyToSender: entry.replyToSender,
+      ReplyToIsQuote: entry.replyToIsQuote,
       Timestamp: entry.timestamp ?? undefined,
       MediaPath: entry.mediaPath,
       MediaType: entry.mediaType,
@@ -215,9 +228,6 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
       MediaPaths: entry.mediaPaths,
       MediaUrls: entry.mediaPaths,
       MediaTypes: entry.mediaTypes,
-      ReplyToBody: entry.replyToBody,
-      ReplyToMediaPath: entry.replyToMediaPath,
-      ReplyToMediaType: entry.replyToMediaType,
       WasMentioned: entry.isGroup ? entry.wasMentioned === true : undefined,
       CommandAuthorized: entry.commandAuthorized,
       OriginatingChannel: "signal" as const,
@@ -525,10 +535,9 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
     const rawMessage = dataMessage?.message ?? "";
     const normalizedMessage = renderSignalMentions(rawMessage, dataMessage?.mentions);
     const messageText = normalizedMessage.trim();
+    const groupId = dataMessage?.groupInfo?.groupId ?? undefined;
+    const isGroup = Boolean(groupId);
 
-    const quoteText = dataMessage?.quote?.text?.trim() ?? "";
-    const hasBodyContent =
-      Boolean(messageText || quoteText) || Boolean(!reaction && dataMessage?.attachments?.length);
     const senderDisplay = formatSignalSenderDisplay(sender);
     const { resolveAccessDecision, dmAccess, effectiveDmAllow, effectiveGroupAllow } =
       await resolveSignalAccessState({
@@ -539,6 +548,23 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
         groupAllowFrom: deps.groupAllowFrom,
         sender,
       });
+    const quoteText = dataMessage?.quote?.text?.trim() ?? "";
+    const { contextVisibilityMode, quoteSenderAllowed, visibleQuoteText, visibleQuoteSender } =
+      resolveSignalQuoteContext({
+        cfg: deps.cfg,
+        accountId: deps.accountId,
+        isGroup,
+        dataMessage,
+        effectiveGroupAllow,
+      });
+    if (quoteText && !visibleQuoteText && isGroup) {
+      logVerbose(
+        `signal: drop quote context (mode=${contextVisibilityMode}, sender_allowed=${quoteSenderAllowed ? "yes" : "no"})`,
+      );
+    }
+    const hasBodyContent =
+      Boolean(messageText || visibleQuoteText) ||
+      Boolean(!reaction && dataMessage?.attachments?.length);
 
     if (
       reaction &&
@@ -564,9 +590,7 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
       return;
     }
     const senderIdLine = formatSignalPairingIdLine(sender);
-    const groupId = dataMessage.groupInfo?.groupId ?? undefined;
     const groupName = dataMessage.groupInfo?.groupName ?? undefined;
-    const isGroup = Boolean(groupId);
 
     if (!isGroup) {
       const allowedDirectMessage = await handleSignalDirectMessageAccess({
@@ -667,7 +691,6 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
         reason: "no mention",
         target: senderDisplay,
       });
-      const quoteText = dataMessage.quote?.text?.trim() || "";
       const pendingPlaceholder = (() => {
         if (!dataMessage.attachments?.length) {
           return "";
@@ -687,7 +710,7 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
         const pendingKind = kindFromMime(firstContentType ?? undefined);
         return pendingKind ? `<media:${pendingKind}>` : "<media:attachment>";
       })();
-      const pendingBodyText = messageText || pendingPlaceholder || quoteText;
+      const pendingBodyText = messageText || pendingPlaceholder || visibleQuoteText;
       const historyKey = groupId ?? "unknown";
       recordPendingHistoryEntryIfEnabled({
         historyMap: deps.groupHistories,
@@ -701,6 +724,47 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
             typeof envelope.timestamp === "number" ? String(envelope.timestamp) : undefined,
         },
       });
+      const signalGroupPolicy = resolveChannelGroupPolicy({
+        cfg: deps.cfg,
+        channel: "signal",
+        groupId,
+        accountId: deps.accountId,
+      });
+      if (
+        (signalGroupPolicy.groupConfig?.ingest ?? signalGroupPolicy.defaultConfig?.ingest) === true
+      ) {
+        const canonicalGroupTarget =
+          normalizeSignalMessagingTarget(`group:${groupId}`) ?? `group:${groupId}`;
+        fireAndForgetHook(
+          triggerInternalHook(
+            createInternalHookEvent(
+              "message",
+              "received",
+              route.sessionKey,
+              toInternalMessageReceivedContext({
+                from: `group:${groupId}`,
+                to: canonicalGroupTarget,
+                content: pendingBodyText,
+                timestamp: envelope.timestamp ?? undefined,
+                channelId: "signal",
+                accountId: deps.accountId,
+                conversationId: canonicalGroupTarget,
+                messageId:
+                  typeof envelope.timestamp === "number" ? String(envelope.timestamp) : undefined,
+                senderId: senderDisplay,
+                senderName: envelope.sourceName ?? undefined,
+                provider: "signal",
+                surface: "signal",
+                originatingChannel: "signal",
+                originatingTo: canonicalGroupTarget,
+                isGroup: true,
+                groupId: canonicalGroupTarget,
+              }),
+            ),
+          ),
+          "signal: mention-skip message hook failed",
+        );
+      }
       return;
     }
 
@@ -751,39 +815,7 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
       }
     }
 
-    // Download first attachment from quoted (reply-target) message, if any.
-    let replyToBody: string | undefined;
-    let replyToMediaPath: string | undefined;
-    let replyToMediaType: string | undefined;
-    const quote = dataMessage.quote;
-    if (quote) {
-      replyToBody = quote.text?.trim() || undefined;
-      const quoteAttachments = quote.attachments ?? [];
-      if (!deps.ignoreAttachments && quoteAttachments.length > 0) {
-        const firstQuoteAttachment = quoteAttachments.find((a) => a?.id);
-        if (firstQuoteAttachment) {
-          try {
-            const fetched = await deps.fetchAttachment({
-              baseUrl: deps.baseUrl,
-              account: deps.account,
-              attachment: firstQuoteAttachment,
-              sender: senderRecipient,
-              groupId,
-              maxBytes: deps.mediaMaxBytes,
-            });
-            if (fetched) {
-              replyToMediaPath = fetched.path;
-              replyToMediaType =
-                fetched.contentType ?? firstQuoteAttachment.contentType ?? undefined;
-            }
-          } catch (err) {
-            logVerbose(`quoted attachment fetch failed: ${String(err)}`);
-          }
-        }
-      }
-    }
-
-    const bodyText = messageText || placeholder || dataMessage.quote?.text?.trim() || "";
+    const bodyText = messageText || placeholder || visibleQuoteText || "";
     if (!bodyText) {
       return;
     }
@@ -832,11 +864,11 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
       mediaType,
       mediaPaths: mediaPaths.length > 0 ? mediaPaths : undefined,
       mediaTypes: mediaTypes.length > 0 ? mediaTypes : undefined,
-      replyToBody,
-      replyToMediaPath,
-      replyToMediaType,
       commandAuthorized,
       wasMentioned: effectiveWasMentioned,
+      replyToBody: visibleQuoteText || undefined,
+      replyToSender: visibleQuoteSender,
+      replyToIsQuote: visibleQuoteText ? true : undefined,
     });
   };
 }

@@ -1,9 +1,4 @@
-import { resolveMentionGating } from "openclaw/plugin-sdk/channel-inbound";
-import { hasControlCommand } from "openclaw/plugin-sdk/command-auth";
 import type { loadConfig } from "openclaw/plugin-sdk/config-runtime";
-import { recordPendingHistoryEntryIfEnabled } from "openclaw/plugin-sdk/reply-history";
-import { parseActivationCommand } from "openclaw/plugin-sdk/reply-runtime";
-import { normalizeE164 } from "openclaw/plugin-sdk/text-runtime";
 import {
   getPrimaryIdentityId,
   getReplyContext,
@@ -16,6 +11,13 @@ import { buildMentionConfig, debugMention, resolveOwnerList } from "../mentions.
 import type { WebInboundMsg } from "../types.js";
 import { stripMentionsForCommand } from "./commands.js";
 import { resolveGroupActivationFor, resolveGroupPolicyFor } from "./group-activation.js";
+import {
+  hasControlCommand,
+  normalizeE164,
+  parseActivationCommand,
+  recordPendingHistoryEntryIfEnabled,
+  resolveMentionGating,
+} from "./group-gating.runtime.js";
 import { noteGroupMember } from "./group-members.js";
 
 export type GroupHistoryEntry = {
@@ -38,6 +40,7 @@ type ApplyGroupGatingParams = {
   groupHistories: Map<string, GroupHistoryEntry[]>;
   groupHistoryLimit: number;
   groupMemberNames: Map<string, Map<string, string>>;
+  selfChatMode?: boolean;
   logVerbose: (msg: string) => void;
   replyLogger: { debug: (obj: unknown, msg: string) => void };
 };
@@ -140,25 +143,16 @@ export function applyGroupGating(params: ApplyGroupGatingParams) {
     conversationId: params.conversationId,
   });
   const requireMention = activation !== "always";
-  const selfJid = params.msg.selfJid?.replace(/:\d+/, "");
-  const replySenderJid = params.msg.replyToSenderJid?.replace(/:\d+/, "");
-  const selfE164 = params.msg.selfE164 ? normalizeE164(params.msg.selfE164) : null;
-  const replySenderE164 = params.msg.replyToSenderE164
-    ? normalizeE164(params.msg.replyToSenderE164)
-    : null;
-  // Detect reply-to-bot: compare JIDs and E.164 numbers.
-  // replyToSenderJid is pre-resolved from LID→phone in the inbound monitor,
-  // so a direct comparison covers the LID mismatch case.
-  const implicitMention = Boolean(
-    (selfJid && replySenderJid && selfJid === replySenderJid) ||
-    (selfE164 && replySenderE164 && selfE164 === replySenderE164),
-  );
-  // Temporary debug — remove after fix confirmed
-  if (params.msg.replyToBody || params.msg.replyToSenderJid || params.msg.replyToSenderE164) {
-    console.error(
-      `[DEBUG gating] selfJid=${selfJid} selfE164=${selfE164} replySenderJid=${replySenderJid} replySenderE164=${replySenderE164} replyToBody=${params.msg.replyToBody?.slice(0, 20)} implicit=${implicitMention}`,
-    );
-  }
+  const replyContext = getReplyContext(params.msg, params.authDir);
+  const sharedNumberSelfChat = params.selfChatMode === true;
+  // Detect reply-to-bot: compare JIDs, LIDs, and E.164 numbers.
+  // WhatsApp may report the quoted message sender as either a phone JID
+  // (xxxxx@s.whatsapp.net) or a LID (xxxxx@lid), so we compare both.
+  // But in shared-number/selfChatMode setups, replies from the same self number
+  // should not count as implicit bot mentions unless the message explicitly
+  // mentioned the bot in text.
+  const implicitReplyToSelf = sharedNumberSelfChat && identitiesOverlap(self, sender);
+  const implicitMention = !implicitReplyToSelf && identitiesOverlap(self, replyContext?.sender);
   const mentionGate = resolveMentionGating({
     requireMention,
     canDetectMention: true,

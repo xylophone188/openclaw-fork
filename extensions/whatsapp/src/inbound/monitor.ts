@@ -1,13 +1,13 @@
 import type { AnyMessageContent, proto, WAMessage } from "@whiskeysockets/baileys";
-import { DisconnectReason, isJidGroup } from "@whiskeysockets/baileys";
 import { createInboundDebouncer, formatLocationText } from "openclaw/plugin-sdk/channel-inbound";
 import { recordChannelActivity } from "openclaw/plugin-sdk/infra-runtime";
-import { saveMediaBuffer } from "openclaw/plugin-sdk/media-runtime";
 import { logVerbose, shouldLogVerbose } from "openclaw/plugin-sdk/runtime-env";
 import { createSubsystemLogger } from "openclaw/plugin-sdk/runtime-env";
 import { getChildLogger } from "openclaw/plugin-sdk/text-runtime";
-import { jidToE164, normalizeE164, resolveJidToE164 } from "openclaw/plugin-sdk/text-runtime";
+import { readWebSelfIdentity } from "../auth-store.js";
+import { getPrimaryIdentityId, resolveComparableIdentity } from "../identity.js";
 import { createWaSocket, getStatusCode, waitForWaConnection } from "../session.js";
+import { resolveJidToE164 } from "../text-runtime.js";
 import { checkInboundAccessControl } from "./access-control.js";
 import {
   isRecentInboundMessage,
@@ -22,8 +22,8 @@ import {
   extractText,
 } from "./extract.js";
 import { attachEmitterListener, closeInboundMonitorSocket } from "./lifecycle.js";
-import { downloadInboundMedia, downloadQuotedMedia } from "./media.js";
-import { extractOutboundMentions } from "./outbound-mentions.js";
+import { downloadInboundMedia } from "./media.js";
+import { DisconnectReason, isJidGroup, saveMediaBuffer } from "./runtime-api.js";
 import { createWebSendApi } from "./send-api.js";
 import type { WebInboundMessage, WebListenerCloseReason } from "./types.js";
 
@@ -39,6 +39,8 @@ export async function monitorWebInbox(options: {
   authDir: string;
   onMessage: (msg: WebInboundMessage) => Promise<void>;
   mediaMaxMb?: number;
+  /** Keep the global presence unavailable so self-chat sessions do not mute phone pushes. */
+  selfChatMode?: boolean;
   /** Send read receipts for incoming messages (default true). */
   sendReadReceipts?: boolean;
   /** Debounce window (ms) for batching rapid consecutive messages from the same sender (0 to disable). */
@@ -66,21 +68,21 @@ export async function monitorWebInbox(options: {
     onCloseResolve = null;
     resolver(reason);
   };
+  const presence = options.selfChatMode ? "unavailable" : "available";
 
   try {
-    await sock.sendPresenceUpdate("available");
+    await sock.sendPresenceUpdate(presence);
     if (shouldLogVerbose()) {
-      logVerbose("Sent global 'available' presence on connect");
+      logVerbose(`Sent global '${presence}' presence on connect`);
     }
   } catch (err) {
-    logVerbose(`Failed to send 'available' presence on connect: ${String(err)}`);
+    logVerbose(`Failed to send '${presence}' presence on connect: ${String(err)}`);
   }
 
-  const selfJid = sock.user?.id;
-  const selfE164 = selfJid ? jidToE164(selfJid) : null;
-  // Bot's own LID — not needed anymore; we resolve replySenderJid to E164
-  // via resolveInboundJid and compare with selfE164 in group gating.
-  const selfLid: string | undefined = undefined;
+  const self = await readWebSelfIdentity(
+    options.authDir,
+    sock.user as { id?: string | null; lid?: string | null } | undefined,
+  );
   const debouncer = createInboundDebouncer<WebInboundMessage>({
     debounceMs: options.debounceMs ?? 0,
     buildKey: (msg) => {
@@ -134,12 +136,7 @@ export async function monitorWebInbox(options: {
   });
   const groupMetaCache = new Map<
     string,
-    {
-      subject?: string;
-      participants?: string[];
-      participantJidMap?: Map<string, string>;
-      expires: number;
-    }
+    { subject?: string; participants?: string[]; expires: number }
   >();
   const GROUP_META_TTL_MS = 5 * 60 * 1000; // 5 minutes
   const lidLookup = sock.signalRepository?.lidMapping;
@@ -175,36 +172,18 @@ export async function monitorWebInbox(options: {
     }
     try {
       const meta = await sock.groupMetadata(jid);
-      const participantJidMap = new Map<string, string>();
       const participants =
         (
           await Promise.all(
             meta.participants?.map(async (p) => {
               const mapped = await resolveInboundJid(p.id);
-              const resolved = mapped ?? p.id;
-              // Map normalized display number → original JID so outbound mentions
-              // use the correct JID type (phone @s.whatsapp.net vs LID @lid).
-              // Strip device suffix before normalizing so LID JIDs like
-              // "123456:1@hosted.lid" don't merge the device digit into the number.
-              const normalized = normalizeE164(resolved.replace(/:[\d]+@/, "@"));
-              if (normalized) {
-                participantJidMap.set(normalized, p.id);
-              }
-              // Also map the raw JID digits so the agent can mention using
-              // either the resolved phone or the raw LID number it sees in
-              // inbound message bodies (e.g. "@101653353078797").
-              const rawDigits = p.id.replace(/:.*/, "").replace(/@.*/, "");
-              if (rawDigits && rawDigits !== normalized?.replace(/^\+/, "")) {
-                participantJidMap.set(`+${rawDigits}`, p.id);
-              }
-              return resolved;
+              return mapped ?? p.id;
             }) ?? [],
           )
         ).filter(Boolean) ?? [];
       const entry = {
         subject: meta.subject,
         participants,
-        participantJidMap,
         expires: Date.now() + GROUP_META_TTL_MS,
       };
       groupMetaCache.set(jid, entry);
@@ -340,8 +319,6 @@ export async function monitorWebInbox(options: {
     mediaPath?: string;
     mediaType?: string;
     mediaFileName?: string;
-    replyToMediaPath?: string;
-    replyToMediaType?: string;
   };
 
   const enrichInboundMessage = async (msg: WAMessage): Promise<EnrichedInboundMessage | null> => {
@@ -385,33 +362,6 @@ export async function monitorWebInbox(options: {
       logVerbose(`Inbound media download failed: ${String(err)}`);
     }
 
-    // Download media from the quoted (reply-target) message, if any.
-    let replyToMediaPath: string | undefined;
-    let replyToMediaType: string | undefined;
-    if (replyContext?.quotedMediaMessage) {
-      try {
-        const quotedMedia = await downloadQuotedMedia(replyContext.quotedMediaMessage, sock);
-        if (quotedMedia) {
-          const maxMb =
-            typeof options.mediaMaxMb === "number" && options.mediaMaxMb > 0
-              ? options.mediaMaxMb
-              : 50;
-          const maxBytes = maxMb * 1024 * 1024;
-          const saved = await saveMediaBuffer(
-            quotedMedia.buffer,
-            quotedMedia.mimetype,
-            "inbound",
-            maxBytes,
-            quotedMedia.fileName,
-          );
-          replyToMediaPath = saved.path;
-          replyToMediaType = quotedMedia.mimetype;
-        }
-      } catch (err) {
-        logVerbose(`Quoted media download failed: ${String(err)}`);
-      }
-    }
-
     return {
       body,
       location: location ?? undefined,
@@ -419,8 +369,6 @@ export async function monitorWebInbox(options: {
       mediaPath,
       mediaType,
       mediaFileName,
-      replyToMediaPath,
-      replyToMediaType,
     };
   };
 
@@ -430,9 +378,6 @@ export async function monitorWebInbox(options: {
     enriched: EnrichedInboundMessage,
   ) => {
     const chatJid = inbound.remoteJid;
-    // Retrieve the participant JID map from the cached group metadata so
-    // outbound @mentions resolve to the correct JID type (phone vs LID).
-    const groupJidMap = inbound.group ? groupMetaCache.get(chatJid)?.participantJidMap : undefined;
     const sendComposing = async () => {
       try {
         await sock.sendPresenceUpdate("composing", chatJid);
@@ -441,21 +386,9 @@ export async function monitorWebInbox(options: {
       }
     };
     const reply = async (text: string) => {
-      const mentions = extractOutboundMentions(text, groupJidMap);
-      await sendTrackedMessage(chatJid, {
-        text,
-        ...(mentions.length > 0 ? { mentions } : {}),
-      });
+      await sendTrackedMessage(chatJid, { text });
     };
     const sendMedia = async (payload: AnyMessageContent) => {
-      const caption = "caption" in payload ? (payload as { caption?: string }).caption : undefined;
-      if (caption) {
-        const mentions = extractOutboundMentions(caption, groupJidMap);
-        if (mentions.length > 0) {
-          await sendTrackedMessage(chatJid, { ...payload, mentions } as AnyMessageContent);
-          return;
-        }
-      }
       await sendTrackedMessage(chatJid, payload);
     };
     const timestamp = inbound.messageTimestampMs;
@@ -496,19 +429,9 @@ export async function monitorWebInbox(options: {
       replyTo: enriched.replyContext ?? undefined,
       replyToId: enriched.replyContext?.id,
       replyToBody: enriched.replyContext?.body,
-      replyToSender: enriched.replyContext?.sender,
-      // Resolve LID→phone so reply-to-bot detection works when WhatsApp
-      // reports the quoted sender as a LID instead of a phone-number JID.
-      // Always resolve via resolveInboundJid to handle LID→phone mapping;
-      // the raw senderE164 from jidToE164 misinterprets LID numbers as phones.
-      replyToSenderJid: enriched.replyContext?.senderJid ?? undefined,
-      replyToSenderE164: enriched.replyContext?.senderJid
-        ? ((await resolveInboundJid(enriched.replyContext.senderJid)) ??
-          enriched.replyContext.senderE164 ??
-          undefined)
-        : undefined,
-      replyToMediaPath: enriched.replyToMediaPath,
-      replyToMediaType: enriched.replyToMediaType,
+      replyToSender: enriched.replyContext?.sender?.label ?? undefined,
+      replyToSenderJid: enriched.replyContext?.sender?.jid ?? undefined,
+      replyToSenderE164: enriched.replyContext?.sender?.e164 ?? undefined,
       groupSubject: inbound.groupSubject,
       groupParticipants: inbound.groupParticipants,
       mentions: mentionedJids ?? undefined,
@@ -609,6 +532,20 @@ export async function monitorWebInbox(options: {
     "connection.update",
     handleConnectionUpdate as unknown as (...args: unknown[]) => void,
   );
+
+  void (async () => {
+    try {
+      const groups = await sock.groupFetchAllParticipating();
+      if (shouldLogVerbose()) {
+        logVerbose(`Hydrated ${Object.keys(groups ?? {}).length} participating groups on connect`);
+      }
+    } catch (err) {
+      const error = String(err);
+      inboundLogger.warn({ error }, "failed hydrating participating groups on connect");
+      inboundConsoleLog.warn(`Failed hydrating participating groups on connect: ${error}`);
+      logVerbose(`Failed to hydrate participating groups on connect: ${error}`);
+    }
+  })();
 
   const sendApi = createWebSendApi({
     sock: {
