@@ -268,6 +268,33 @@ export function buildInboundUserContextPrefix(
     );
   }
 
+  if (ctx.ReplyToBody) {
+    // Place the [media attached:] marker *outside* the JSON block so
+    // path characters are never escaped by JSON.stringify and the image
+    // detection regex (`detectAndLoadPromptImages`) picks it up reliably.
+    const replyMediaNote = ctx.ReplyToMediaPath?.trim()
+      ? `[media attached: ${ctx.ReplyToMediaPath.trim()}${ctx.ReplyToMediaType?.trim() ? ` (${ctx.ReplyToMediaType.trim()})` : ""}]`
+      : undefined;
+    const lines = [
+      "Replied message (untrusted, for context):",
+      "```json",
+      JSON.stringify(
+        {
+          sender_label: normalizePromptMetadataString(ctx.ReplyToSender),
+          is_quote: ctx.ReplyToIsQuote === true ? true : undefined,
+          body: ctx.ReplyToBody,
+        },
+        null,
+        2,
+      ),
+      "```",
+    ];
+    if (replyMediaNote) {
+      lines.push(replyMediaNote);
+    }
+    blocks.push(lines.join("\n"));
+  }
+
   if (boundedHistory.length > 0) {
     blocks.push(
       formatUntrustedJsonBlock(
